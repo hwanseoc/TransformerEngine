@@ -64,7 +64,6 @@ from ...triton.grouped_dbias_dscales import (
     compute_grouped_dbias_dscales,
 )
 
-
 # Keys for passing caller-provided output and grad-input buffers to a grouped
 # linear (or fused grouped MLP) through Sequential's ``op_kwargs``.
 OUTPUT_BUFFER_KEY = "output"
@@ -755,7 +754,12 @@ class GroupedLinear(BasicOperation):
                             f"Expected no biases, but bias {group_idx} is initialized"
                         )
 
-    def pre_fuser_forward(self, *, requires_grad: bool) -> None:
+    def pre_fuser_forward(
+        self,
+        *,
+        requires_grad: bool,
+        quantizer_group_indices: Optional[Iterable[int]] = None,
+    ) -> None:
         super().pre_fuser_forward(requires_grad=requires_grad)
         if FP8GlobalStateManager.is_fp8_enabled():
             # Assume weights have consistent grad requirement
@@ -767,7 +771,12 @@ class GroupedLinear(BasicOperation):
             weight_requires_grad = requires_grad and weight_requires_grad
 
             # Configure quantizer usages
-            for group_idx in range(self.num_groups):
+            group_indices = (
+                range(self.num_groups)
+                if quantizer_group_indices is None
+                else quantizer_group_indices
+            )
+            for group_idx in group_indices:
                 input_quantizer = self.get_quantizer("forward", 2 * group_idx)
                 weight_quantizer = self.get_quantizer("forward", 2 * group_idx + 1)
                 grad_output_quantizer = self.get_quantizer("backward", group_idx)

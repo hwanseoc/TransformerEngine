@@ -811,7 +811,7 @@ class OperationFuser:
         self.maybe_fuse_ops(is_grad_enabled, recipe, input, basic_op_extra_inputs)
 
         # Initialization before forward
-        for idx, op in enumerate(self._basic_ops):
+        for op in self._basic_ops:
             if torch.compiler.is_compiling() and op._fp8_metas is not None:
                 if any(
                     meta is not None and _has_delayed_scaling_state(meta)
@@ -821,7 +821,19 @@ class OperationFuser:
                         "Delayed scaling is not supported under torch.compile in OperationFuser, "
                         "including CustomRecipe with DelayedScalingRequest."
                     )
-            op.pre_fuser_forward(requires_grad=idx >= self.first_op_requiring_backward)
+        for op, basic_op_idxs in self._forward_ops:
+            prepare = getattr(op, "pre_fuser_forward_ops", None)
+            if prepare is not None:
+                prepare(
+                    requires_grad=tuple(
+                        idx >= self.first_op_requiring_backward for idx in basic_op_idxs
+                    )
+                )
+            else:
+                for idx in basic_op_idxs:
+                    self._basic_ops[idx].pre_fuser_forward(
+                        requires_grad=idx >= self.first_op_requiring_backward
+                    )
 
         # Fuser forward pass
         # Note: We call forward directly when is_grad_enabled=False,
