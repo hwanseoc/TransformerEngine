@@ -1661,6 +1661,8 @@ class TestGroupedMLPFusedOp:
         assert fused_cls.is_supported()
         # FC2 bias-gradient accumulation uses an atomic Triton reduction.
         monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
+        # Prepared plans bypass the traced wrappers.
+        monkeypatch.setenv("NVTE_GROUPED_MLP_PREPARED", "0")
         if single_grouped_weight:
             monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
 

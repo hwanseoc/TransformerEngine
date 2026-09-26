@@ -6,6 +6,8 @@
 from dataclasses import dataclass, field
 import os
 
+NON_SCALAR_ARGUMENTS = frozenset(("padded_offsets", "current_stream", "b_ptrs", "sfb_ptrs"))
+
 
 @dataclass
 class GroupedMLPExecution:
@@ -35,27 +37,24 @@ class GroupedMLPExecution:
             or (prob is not None and (prob.shape != (a.shape[0],) or not prob.is_contiguous()))
         ):
             return kernel(**kwargs)
-        scalars = tuple(
-            (name, value)
-            for name, value in kwargs.items()
-            if not name.endswith("_tensor")
-            and name not in ("padded_offsets", "current_stream", "b_ptrs", "sfb_ptrs")
-        )
+        # Plans accept any routed row count, so M is not part of the key.
         key = (
             kind,
-            tuple(a.shape),
+            int(kwargs["current_stream"]),
+            a.shape[1],
             a.dtype,
             a.device,
-            tuple(b.shape),
+            b.shape,
             b.dtype,
             kwargs["alpha_tensor"].dtype,
-            None if kwargs.get("prob_tensor") is None else kwargs["prob_tensor"].dtype,
+            None if prob is None else prob.dtype,
             None if kwargs.get("bias_tensor") is None else kwargs["bias_tensor"].dtype,
             kwargs.get("scheduler_counter_tensor") is not None,
-            int(kwargs["current_stream"]),
-            scalars,
-            os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
-            os.getenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0",
+            *(
+                item
+                for item in kwargs.items()
+                if item[0] not in NON_SCALAR_ARGUMENTS and not item[0].endswith("_tensor")
+            ),
         )
         plan = self.plans.get(key)
         if plan is None:

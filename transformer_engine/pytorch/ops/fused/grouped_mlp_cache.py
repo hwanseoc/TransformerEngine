@@ -66,16 +66,8 @@ def grouped_mlp_weight_cache():
 
 
 def weight_buffer_signature(tensor):
-    """Describe the current source allocation and its interpretation."""
-    return (
-        id(tensor),
-        tensor.data_ptr(),
-        tuple(tensor.shape),
-        tuple(tensor.stride()),
-        tensor.storage_offset(),
-        tensor.dtype,
-        tensor.device,
-    )
+    """Describe a retained source buffer's current allocation and layout."""
+    return (tensor.data_ptr(), tensor.shape, tensor.stride())
 
 
 def swizzle_grouped_weight(weight):
@@ -92,6 +84,7 @@ def packed_grouped_weight_scales(
     enabled,
     scale_dtype,
     layout_key=(),
+    stream=None,
     swizzle=swizzle_grouped_weight,
 ):
     """Return packed rowwise scales viewed as ``scale_dtype``.
@@ -100,14 +93,16 @@ def packed_grouped_weight_scales(
     the grouped swizzle (not the single-group special path). ``layout_key``
     contains any caller-specific quantization/layout configuration. Callers
     always obtain B data from the current weight, independently of this cache.
+    ``stream`` is the current CUDA stream handle, when the caller already has it.
     ``swizzle`` mutates the supplied shallow copy's ``scale_inv`` only.
     """
     cache = weight_cache_context.get() if enabled else None
     if cache is not None:
         data = weight.rowwise_data
         scales = weight.scale_inv
-        stream = torch.cuda.current_stream(scales.device) if scales.is_cuda else None
-        key = (id(owner), scales.device, None if stream is None else stream.cuda_stream)
+        if stream is None and scales.is_cuda:
+            stream = torch.cuda.current_stream(scales.device).cuda_stream
+        key = (id(owner), scales.device, stream)
         signature = (
             weight_buffer_signature(data),
             weight_buffer_signature(scales),
@@ -119,11 +114,11 @@ def packed_grouped_weight_scales(
             layout_key,
         )
         entry = cache.entries.get(key)
-        if entry is not None and entry[0] == signature:
+        if entry is not None and entry[0] == signature and entry[2] is data and entry[3] is scales:
             return entry[-1]
     prepared = weight.copy()
     swizzle(prepared)
     packed = prepared.scale_inv.view(dtype=scale_dtype)
     if cache is not None:
-        cache.entries[key] = (signature, owner, data, scales, weight.quantizer, stream, packed)
+        cache.entries[key] = (signature, owner, data, scales, weight.quantizer, packed)
     return packed

@@ -108,7 +108,8 @@ def test_plan_reuse(module):
     assert factory.call_count == 1
     assert plans[0].run.call_count == 2
     plans[0].run.assert_called_with(check=False, **second)
-    assert execution.run("glu", kernel, arguments(768)) == ("plan", 1)
+    assert execution.run("glu", kernel, arguments(768)) == ("plan", 0), "Plans accept any M"
+    assert execution.run("glu", kernel, dict(first, use_dynamic_sched=False)) == ("plan", 1)
     assert factory.call_count == 2 and len(execution.plans) == 2
     kernel.assert_not_called()
 
@@ -116,12 +117,12 @@ def test_plan_reuse(module):
 def test_cache_bound(module):
     execution, kernel, factory, plans = harness(module)
     for index in range(12):
-        kwargs = arguments(256 * (index + 1))
+        kwargs = dict(arguments(), b_tensor=Tensor((4, 512 * (index + 1), 256)))
         execution.run("glu", kernel, kwargs)
         assert len(execution.plans) <= 4, (index, len(execution.plans))
     assert factory.call_count == 12
     execution.run("glu", kernel, kwargs)
-    assert factory.call_count == 12, "Most recent shape should remain cached"
+    assert factory.call_count == 12, "Most recent configuration should remain cached"
     kernel.assert_not_called()
 
 

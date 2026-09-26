@@ -1601,6 +1601,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                     enabled=not use_nvfp4 and fc1_op.weight.quantizer is not None,
                     scale_dtype=scale_view_dtype,
                     layout_key=(num_groups, tuple(fc1_weight_shape), sf_vec_size),
+                    stream=current_stream,
                 )
 
             # Pack weight tensors for stacked kernel
@@ -1883,6 +1884,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                         enabled=fc2_op.weight.quantizer is not None,
                         scale_dtype=torch.float8_e8m0fnu,
                         layout_key=(num_groups, tuple(fc2_weight_shape), MXFP8_BLOCK_SCALING_SIZE),
+                        stream=current_stream,
                     )
 
                     fc2_w_data = fc2_weight_for_gemm.rowwise_data
