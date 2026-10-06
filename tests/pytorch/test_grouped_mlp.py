@@ -1776,6 +1776,7 @@ class TestGroupedMLPFusedOp:
         kernels = {
             "grouped_gemm_activation_kernel": fused_cls.grouped_gemm_activation_kernel(),
             "grouped_gemm_quant_kernel": fused_cls.grouped_gemm_quant_kernel(),
+            "grouped_gemm_dactivation_kernel": fused_cls.grouped_gemm_dactivation_kernel(),
         }
         if not all(
             getattr(kernel, "supports_canonical_layouts", False) for kernel in kernels.values()
@@ -1842,7 +1843,8 @@ class TestGroupedMLPFusedOp:
 
         legacy, _ = run(canonical=False)
         canonical, a_ranks = run(canonical=True)
-        assert a_ranks[:2] == [2, 2]
+        # FC1 GLU, FC2 quant, FC2 dGLU, and FC1 dgrad quant.
+        assert a_ranks == [2, 2, 2, 2]
         for actual, expected in zip(canonical, legacy):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
