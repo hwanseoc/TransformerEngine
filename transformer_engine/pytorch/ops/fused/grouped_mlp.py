@@ -3436,6 +3436,7 @@ def _bf16_dglu_weight_kwargs(
     fc_op: GroupedLinear,
     num_groups: int,
     device: torch.device,
+    n_major_packed: bool,
 ) -> dict[str, Any]:
     """Wrapper kwargs for the dGLU kernel's dgrad-orientation (MN-major) B operand.
 
@@ -3447,9 +3448,11 @@ def _bf16_dglu_weight_kwargs(
     MN-major with no copy. That works for packed weights too, since the
     per-expert views point into the packed buffer.
 
-    Only valid for dGLU: the plain BF16 grouped GEMM is K-major only; see
-    ``_bf16_transposed_weight_kwargs``.
+    With ``n_major_packed``, a packed weight goes to cuDNN as the dense
+    ``(experts, out, in)`` buffer, an N-major canonical B.
     """
+    if fc_op.single_grouped_weight and n_major_packed:
+        return {"b_tensor": _bf16_packed_weight(fc_op, num_groups), "b_major": "n"}
     weights = _bf16_per_expert_weights(fc_op, num_groups)
     return {
         "b_ptrs": tex.copy_data_ptrs_to_device(weights, device),
@@ -3459,7 +3462,9 @@ def _bf16_dglu_weight_kwargs(
     }
 
 
-def _bf16_transposed_weight_kwargs(fc_op: GroupedLinear, num_groups: int) -> dict[str, Any]:
+def _bf16_transposed_weight_kwargs(
+    fc_op: GroupedLinear, num_groups: int, n_major_packed: bool
+) -> dict[str, Any]:
     """Wrapper kwargs for the plain BF16 grouped GEMM's dgrad B operand (FC1 dgrad).
 
     Unlike dGLU, the plain BF16 grouped GEMM accepts only K-major B (cuDNN
@@ -3467,7 +3472,12 @@ def _bf16_transposed_weight_kwargs(fc_op: GroupedLinear, num_groups: int) -> dic
     per-expert transpose is materialized: one read and write of the weight per
     backward, small next to the GEMMs. The result is a dense
     ``(in, out, experts)`` operand with stride ``(out, 1, in * out)``.
+
+    With ``n_major_packed``, a packed weight goes to cuDNN as the dense
+    ``(experts, out, in)`` buffer, an N-major canonical B, and is not copied.
     """
+    if fc_op.single_grouped_weight and n_major_packed:
+        return {"b_tensor": _bf16_packed_weight(fc_op, num_groups), "b_major": "n"}
     if fc_op.single_grouped_weight:
         weight_t = _bf16_packed_weight(fc_op, num_groups).transpose(1, 2).contiguous()
     else:
@@ -3714,6 +3724,13 @@ class GroupedMLP_CuTeGEMMGLUBf16(FusedOperation):
                 "SiTU-GLU or SReLU variant."
             )
         self._cudnn_act_func, self._cudnn_dact_func, self._cudnn_linear_offset = act_funcs
+        # With canonical BF16 layouts, cuDNN takes the stored (experts, out, in) weight as an
+        # N-major dgrad B, so packed weights need no transpose copy or pointer array.
+        self._cudnn_n_major_packed_weight = getattr(
+            self.grouped_gemm_kernel(), "supports_bf16_canonical_layouts", False
+        ) and getattr(
+            self.grouped_gemm_dactivation_kernel(), "supports_bf16_canonical_layouts", False
+        )
 
     def _check_token_alignment(self, num_tokens: int) -> None:
         """The kernels require a 256-aligned token count (and 256-aligned groups).
@@ -4003,7 +4020,9 @@ class GroupedMLP_CuTeGEMMGLUBf16(FusedOperation):
             "use_dynamic_sched": True,
             "current_stream": current_stream,
         }
-        fc2_dactivation_kwargs.update(_bf16_dglu_weight_kwargs(fc2_op, num_groups, device))
+        fc2_dactivation_kwargs.update(
+            _bf16_dglu_weight_kwargs(fc2_op, num_groups, device, self._cudnn_n_major_packed_weight)
+        )
         fc2_dgrad_kernel_out = self.grouped_gemm_dactivation_kernel()(**fc2_dactivation_kwargs)
 
         fc1_dy = fc2_dgrad_kernel_out["d_row_tensor"].view(total_tokens, fc1_weight_shape[0])
@@ -4084,7 +4103,11 @@ class GroupedMLP_CuTeGEMMGLUBf16(FusedOperation):
                 "use_dynamic_sched": True,
                 "current_stream": current_stream,
             }
-            fc1_dgrad_kwargs.update(_bf16_transposed_weight_kwargs(fc1_op, num_groups))
+            fc1_dgrad_kwargs.update(
+                _bf16_transposed_weight_kwargs(
+                    fc1_op, num_groups, self._cudnn_n_major_packed_weight
+                )
+            )
             self.grouped_gemm_kernel()(**fc1_dgrad_kwargs)
             grad_input = grad_input_buffer
 
