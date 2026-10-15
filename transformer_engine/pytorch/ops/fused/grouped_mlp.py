@@ -1232,6 +1232,9 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
         self._cudnn_canonical_layouts = getattr(
             self.grouped_gemm_activation_kernel(), "supports_canonical_layouts", False
         ) and getattr(self.grouped_gemm_quant_kernel(), "supports_canonical_layouts", False)
+        self._cudnn_canonical_nvfp4 = self._cudnn_canonical_layouts and getattr(
+            self.grouped_gemm_act_hadamard_kernel(), "supports_canonical_layouts", False
+        )
         self._cudnn_canonical_backward = self._cudnn_canonical_layouts and getattr(
             self.grouped_gemm_dactivation_kernel(), "supports_canonical_layouts", False
         )
@@ -1592,15 +1595,29 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
         #   sum(m)/128, 4 (block col), k/128, 1)
         # With canonical layouts, cuDNN takes A as (sum(m), k), B as
         # (num_groups, n, k), and scales as the packed buffers as-is.
-        canonical = self._cudnn_canonical_layouts and not use_nvfp4
+        with_gemm_swizzled_scales = grouped_fc1_x._with_gemm_swizzled_scales
+        if use_nvfp4:
+            # The fused GEMM + act + RHT + quant kernel takes only the legacy layouts.
+            canonical = (
+                self._cudnn_canonical_nvfp4
+                and with_gemm_swizzled_scales
+                and not (
+                    isinstance(fc2_input_quantizer, NVFP4Quantizer)
+                    and fc2_input_quantizer.with_rht
+                    and fc2_input_quantizer.disable_second_level_scale
+                )
+            )
+        else:
+            canonical = self._cudnn_canonical_layouts
         fc1_x_data = grouped_fc1_x.rowwise_data.view(dtype=data_dtype)
         fc1_x_data = fc1_x_data.view(in_shape[0], data_in_k)
         if not canonical:
             fc1_x_data = fc1_x_data.unsqueeze(0).permute(1, 2, 0)
         fc1_x_scales = grouped_fc1_x.scale_inv
         fc1_x_scales = fc1_x_scales.view(dtype=scale_view_dtype)
-        with_gemm_swizzled_scales = grouped_fc1_x._with_gemm_swizzled_scales
-        if use_nvfp4 and with_gemm_swizzled_scales:
+        if canonical:
+            pass
+        elif use_nvfp4 and with_gemm_swizzled_scales:
             fc1_x_scales = fc1_x_scales.view(
                 1,
                 ceil_div(in_shape[0], 128),
@@ -1620,7 +1637,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 4,
             )
             fc1_x_scales = fc1_x_scales.permute(3, 2, 1, 5, 4, 0)
-        elif not canonical:
+        else:
             fc1_x_scales = fc1_x_scales.view(
                 1,
                 ceil_div(in_shape[0], 128),
