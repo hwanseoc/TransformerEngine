@@ -881,11 +881,12 @@ def _compute_grad_params(
                 )
                 accumulate_into_main_grad = get_accumulate_flag_in_param(weights[0])
             else:
-                grouped_wgrad = GroupedTensor.make_grouped_tensor_with_shapes(
+                grouped_wgrad = GroupedTensor.make_grouped_tensor_from_rowwise_data(
                     num_tensors=num_groups,
-                    shapes=[weight_shape] * num_groups,
-                    quantizer=None,
-                    device=device,
+                    tensor_shape=weight_shape,
+                    rowwise_data=torch.empty(
+                        (num_groups, *weight_shape), dtype=dtype, device=device
+                    ),
                     dtype=dtype,
                 )
             wgrad_output = grouped_wgrad
