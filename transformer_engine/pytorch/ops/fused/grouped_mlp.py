@@ -439,7 +439,8 @@ def _nvfp4_amax(
     amaxes = [getattr(tensor, tensor_attr) for tensor in tensors]
     if any(amax is None for amax in amaxes):
         raise RuntimeError(f"NVFP4 tensor list is missing {tensor_attr}.")
-    return torch.cat([amax.view(-1) for amax in amaxes], dim=0)
+    # NVFP4 amaxes are 1-D, so they concatenate without per-tensor views.
+    return torch.cat(amaxes)
 
 
 # TODO(kainingz): remove this temporary workaround after pytorch & tvm-ffi supports e5m3 GEMM
