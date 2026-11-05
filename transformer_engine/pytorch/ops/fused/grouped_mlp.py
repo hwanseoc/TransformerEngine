@@ -476,21 +476,39 @@ def _nvfp4_scale_max(quantizer: Quantizer) -> float:
     return 448.0
 
 
-def _nvfp4_global_scale(
-    tensors: GroupedTensor | Iterable[NVFP4TensorStorage],
-    quantizer: Quantizer,
+def _nvfp4_global_scale_factors(
+    a: GroupedTensor | Iterable[NVFP4TensorStorage],
+    a_quantizer: Quantizer,
+    b: GroupedTensor | Iterable[NVFP4TensorStorage],
+    b_quantizer: Quantizer,
     *,
-    columnwise: bool,
+    a_columnwise: bool,
+    b_columnwise: bool,
     num_groups: int,
     device: torch.device,
-) -> torch.Tensor:
-    """Return the per-group global scale factor for an NVFP4 operand."""
-    if getattr(quantizer, "disable_second_level_scale", False):
-        # The second-level scale is disabled, so the global scale is always 1.0.
-        return get_cached_ones_tensor(num_groups, torch.float32, device)
-    # 6.0 is NVFP4_FP4_MAX
-    denom = 6.0 * _nvfp4_scale_max(quantizer)
-    return _nvfp4_amax(tensors, columnwise=columnwise).to(torch.float32) / denom
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return two per-group tensors whose product is the product of the operands' global scales.
+
+    Each NVFP4 global scale is amax / (6.0 * scale max). Folding both divisors into one
+    multiply launches one kernel instead of one per operand.
+    """
+    ones = get_cached_ones_tensor(num_groups, torch.float32, device)
+    factors = []
+    denom = 1.0
+    for tensors, quantizer, columnwise in (
+        (a, a_quantizer, a_columnwise),
+        (b, b_quantizer, b_columnwise),
+    ):
+        if getattr(quantizer, "disable_second_level_scale", False):
+            # The second-level scale is disabled, so the global scale is always 1.0.
+            factors.append(ones)
+        else:
+            # 6.0 is NVFP4_FP4_MAX
+            denom *= 6.0 * _nvfp4_scale_max(quantizer)
+            factors.append(_nvfp4_amax(tensors, columnwise=columnwise))
+    if denom == 1.0:
+        return factors[0], factors[1]
+    return factors[0], factors[1] * (1.0 / denom)
 
 
 def _single_quantized_tensor_from_grouped(
@@ -809,20 +827,19 @@ def _cudnn_compute_wgrad(
                 device=device,
             )
         else:
-            common_wgrad_kwargs["global_scale_a"] = _nvfp4_global_scale(
+            # The kernel multiplies the two global scales, so either may carry both divisors.
+            global_scale_a, global_scale_b = _nvfp4_global_scale_factors(
                 grouped_dy,
                 dy_quantizer,
-                columnwise=True,
-                num_groups=num_groups,
-                device=device,
-            )
-            common_wgrad_kwargs["global_scale_b"] = _nvfp4_global_scale(
                 grouped_x,
                 x_quantizer,
-                columnwise=True,
+                a_columnwise=True,
+                b_columnwise=True,
                 num_groups=num_groups,
                 device=device,
             )
+            common_wgrad_kwargs["global_scale_a"] = global_scale_a
+            common_wgrad_kwargs["global_scale_b"] = global_scale_b
         common_wgrad_kwargs["input_order"] = "tensor_ragged"
         wgrad_sf_dtype_override = _nvfp4_sf_dtype_override(dy_quantizer)
         if wgrad_sf_dtype_override is not None:
@@ -1741,22 +1758,17 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
             # cuDNN receives NVFP4 block-scaled inputs without TE's per-group
             # global scale factors, so alpha supplies the product of the two
             # operand global scales.
-            fc1_alpha_tensor = (
-                _nvfp4_global_scale(
-                    grouped_fc1_x,
-                    fc1_input_quantizer,
-                    columnwise=False,
-                    num_groups=num_groups,
-                    device=device,
-                )
-                * _nvfp4_global_scale(
-                    grouped_fc1_weight,
-                    fc1_weight_quantizer,
-                    columnwise=False,
-                    num_groups=num_groups,
-                    device=device,
-                )
-            ).to(torch.float32)
+            fc1_x_global, fc1_w_global = _nvfp4_global_scale_factors(
+                grouped_fc1_x,
+                fc1_input_quantizer,
+                grouped_fc1_weight,
+                fc1_weight_quantizer,
+                a_columnwise=False,
+                b_columnwise=False,
+                num_groups=num_groups,
+                device=device,
+            )
+            fc1_alpha_tensor = fc1_x_global * fc1_w_global
         else:
             fc1_alpha_tensor = alpha_tensor
 
@@ -2078,22 +2090,17 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 sf_swizzled=grouped_fc2_x._with_gemm_swizzled_scales,
             )
 
-            fc2_fwd_alpha_tensor = (
-                _nvfp4_global_scale(
-                    grouped_fc2_x,
-                    fc2_input_quantizer,
-                    columnwise=False,
-                    num_groups=num_groups,
-                    device=device,
-                )
-                * _nvfp4_global_scale(
-                    grouped_fc2_weight,
-                    fc2_weight_quantizer,
-                    columnwise=False,
-                    num_groups=num_groups,
-                    device=device,
-                )
-            ).to(torch.float32)
+            fc2_x_global, fc2_w_global = _nvfp4_global_scale_factors(
+                grouped_fc2_x,
+                fc2_input_quantizer,
+                grouped_fc2_weight,
+                fc2_weight_quantizer,
+                a_columnwise=False,
+                b_columnwise=False,
+                num_groups=num_groups,
+                device=device,
+            )
+            fc2_fwd_alpha_tensor = fc2_x_global * fc2_w_global
 
             fc2_scales_tensor = (
                 fc2_scales.detach().to(dtype=torch.float32).reshape(-1, 1, 1)
@@ -2617,34 +2624,24 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
 
         fc2_d_dtype = torch.bfloat16 if use_nvfp4 else torch.float8_e4m3fn
         if use_nvfp4:
-            fc2_dy_global_scale = _nvfp4_global_scale(
+            fc2_dy_global, fc2_w_col_global = _nvfp4_global_scale_factors(
                 grouped_fc2_dy,
                 fc2_grad_output_quantizer,
-                columnwise=False,
-                num_groups=num_groups,
-                device=device,
-            )
-            fc2_weight_col_global_scale = _nvfp4_global_scale(
                 grouped_fc2_weight,
                 fc2_weight_quantizer,
-                columnwise=True,
+                a_columnwise=False,
+                b_columnwise=True,
                 num_groups=num_groups,
                 device=device,
             )
             if activation_is_srelu:
                 # DSReLU applies alpha once, so pass the full product of the
                 # two operand global scales.
-                fc2_alpha_tensor = (
-                    (fc2_dy_global_scale * fc2_weight_col_global_scale)
-                    .to(torch.float32)
-                    .expand(num_groups)
-                )
+                fc2_alpha_tensor = (fc2_dy_global * fc2_w_col_global).expand(num_groups)
             else:
                 # DGLU applies alpha to both gate branches, so the wrapper
                 # expects sqrt(product) to recover the same global-scale factor.
-                fc2_alpha_tensor = torch.sqrt(
-                    fc2_dy_global_scale * fc2_weight_col_global_scale
-                ).expand(num_groups)
+                fc2_alpha_tensor = torch.sqrt(fc2_dy_global * fc2_w_col_global).expand(num_groups)
             fc2_beta_tensor = get_cached_ones_tensor(num_groups, torch.float32, device)
             fc2_norm_const_tensor = None
         else:
@@ -3050,22 +3047,17 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                     sf_swizzled=grouped_fc1_dy._with_gemm_swizzled_scales,
                 )
 
-                fc1_dgrad_alpha = (
-                    _nvfp4_global_scale(
-                        grouped_fc1_dy,
-                        fc1_grad_output_quantizer,
-                        columnwise=False,
-                        num_groups=num_groups,
-                        device=device,
-                    )
-                    * _nvfp4_global_scale(
-                        grouped_fc1_weight,
-                        fc1_weight_quantizer,
-                        columnwise=True,
-                        num_groups=num_groups,
-                        device=device,
-                    )
-                ).to(torch.float32)
+                fc1_dy_global, fc1_w_col_global = _nvfp4_global_scale_factors(
+                    grouped_fc1_dy,
+                    fc1_grad_output_quantizer,
+                    grouped_fc1_weight,
+                    fc1_weight_quantizer,
+                    a_columnwise=False,
+                    b_columnwise=True,
+                    num_groups=num_groups,
+                    device=device,
+                )
+                fc1_dgrad_alpha = fc1_dy_global * fc1_w_col_global
 
                 fc1_dgrad_kwargs = {
                     "a_tensor": fc1_dgrad_a_data,
