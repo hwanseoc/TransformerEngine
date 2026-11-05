@@ -2030,7 +2030,8 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
         fc2_out_shape = in_shape[:-1] + [fc2_weight_shape[0]]
         fc2_scales = basic_op_extra_inputs[2][1] if fc2_op._scale_bias else None
         fc2_input_sf_override = _nvfp4_sf_dtype_override(fc2_input_quantizer)
-        if use_nvfp4 and fc2_input_sf_override is None:
+        # NVFP4 FC2 runs on cuDNN like MXFP8, except a dense single group, which stays on cuBLAS.
+        if use_nvfp4 and fc2_input_sf_override is None and use_dense_single_group:
             fc2_bias_for_gemm = None
             fc2_bias_scale = None
             if fc2_bias_packed is not None:
@@ -2077,9 +2078,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                     bias_scale=fc2_bias_scale,
                 )
             fc2_out = fc2_out_buf
-        elif (
-            use_nvfp4 and fc2_input_sf_override is not None
-        ):  # TODO(kainingz): remove this e5m3 workaround once cuBLAS is ready.
+        elif use_nvfp4:
             fc2_x_data, fc2_x_scales = _convert_to_cudnn_grouped_gemm_tensor_format(
                 grouped_fc2_x.rowwise_data,
                 grouped_fc2_x.scale_inv,
@@ -3006,24 +3005,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                     single_grouped_weight=fc1_op.single_grouped_weight,
                     dtype=dtype,
                 )
-            elif use_nvfp4 and fc1_dgrad_sf_override is None:
-                grad_input = validate_or_alloc_output(grad_input_buffer, in_shape, dtype, device)
-                grouped_grad_input = GroupedTensor(
-                    shape=(out_shape[0], fc1_weight_shape[1]),
-                    dtype=dtype,
-                    num_tensors=num_groups,
-                    quantizer=None,
-                    data=grad_input.view(-1),
-                    first_dims=split_sizes,
-                    tensor_offsets=fc1_x_tensor_offsets,
-                )
-                general_grouped_gemm_for_grouped_tensor(
-                    grouped_fc1_weight,
-                    grouped_fc1_dy,
-                    grouped_grad_input,
-                    layout="NN",
-                )
-            elif use_nvfp4:  # TODO(kainingz): remove this e5m3 workaround once cuBLAS is ready
+            elif use_nvfp4:
                 # This assertion should never fail because we set fc1_grad_output_quantizer.optimize_for_gemm = True
                 assert (
                     grouped_fc1_dy._with_gemm_swizzled_scales
